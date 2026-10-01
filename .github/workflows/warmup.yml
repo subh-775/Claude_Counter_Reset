@@ -1,0 +1,167 @@
+name: claude-warmup
+
+# Keeps a Claude 5-hour usage window always running.
+#
+# The chain: each ping reads the exact reset time of the current window from
+# Claude Code (its rate_limit_event), saves reset + 30 s to next_run.txt, and
+# starts the next run of this workflow (a "waiter"). The waiter sleeps on the
+# runner until that time, pings, and starts the next waiter, and so on.
+# GitHub's cron is far too irregular to time pings (it ran twice in 8 h), so
+# it is only a backup: if a ping is more than 5 min overdue (chain broken), a
+# scheduled run pings and restarts the chain.
+#
+# Public repo = free Actions minutes, so a runner sleeping ~5 h costs nothing.
+on:
+  schedule:
+    - cron: '7-59/10 * * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Ping now, ignoring the schedule'
+        type: boolean
+        default: true
+      chain:
+        description: 'Internal: wait for next_run.txt, then ping'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: write   # to start the next waiter
+
+env:
+  BUFFER_SECONDS: 30          # ping this long after the reset
+  OVERDUE_SECONDS: 300        # cron backup pings only when this late (chain broken)
+  MAX_WAIT_SECONDS: 19800     # a waiter waits at most 5.5 h (job limit is 6 h)
+  FALLBACK_SECONDS: 18300     # 5h05m, only if Claude doesn't report a reset time
+  RETRY_SECONDS: 600          # after a failed ping, try again in 10 min
+  AUTH_RETRY_SECONDS: 21600   # after a rejected token, try again in 6 h
+  PING_TIMEOUT_SECONDS: 120   # give up on a hung `claude -p` after this long
+
+jobs:
+  wait:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    # Only one sleeping waiter at a time: starting a new one cancels the old
+    # one. Only this job is in the group, so when a waiter's ping job starts
+    # the next waiter, its own (already finished) wait job isn't cancelled.
+    # Other runs (cron backups, manual pings) don't block each other.
+    concurrency:
+      group: ${{ inputs.chain && 'claude-waiter' || format('claude-{0}', github.run_id) }}
+      cancel-in-progress: true
+    outputs:
+      run: ${{ steps.due.outputs.run }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main   # newest next_run.txt
+
+      - name: Is a ping due?
+        id: due
+        env:
+          FORCE: ${{ inputs.force }}
+          CHAIN: ${{ inputs.chain }}
+        run: |
+          now=$(date +%s)
+          next=$(cat next_run.txt 2>/dev/null || echo 0)
+          wait=$(( next - now ))
+          echo "next=$next" >> "$GITHUB_OUTPUT"
+          echo "Next ping: $(date -u -d @$next '+%F %T') UTC"
+          if [ "$FORCE" = "true" ]; then
+            echo "Manual ping."
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [ "$CHAIN" = "true" ]; then
+            if [ $wait -le $MAX_WAIT_SECONDS ]; then
+              echo "Waiter: will ping in $(( wait > 0 ? wait / 60 : 0 )) min."
+              echo "run=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Waiter: next ping is over 5.5 h away; the cron backup will handle it."
+            fi
+          elif [ $wait -le -$OVERDUE_SECONDS ]; then
+            echo "::warning::Ping overdue by $(( -wait / 60 )) min, so the chain broke. Pinging and restarting it."
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Backup check: nothing to do."
+          fi
+
+      - name: Wait for reset
+        if: steps.due.outputs.run == 'true'
+        env:
+          FORCE: ${{ inputs.force }}
+          NEXT: ${{ steps.due.outputs.next }}
+        run: |
+          wait=$(( NEXT - $(date +%s) ))
+          if [ "$FORCE" != "true" ] && [ $wait -gt 0 ]; then
+            echo "Waiting until $(date -u -d @$NEXT '+%T') UTC..."
+            sleep $wait
+          fi
+
+  ping:
+    needs: wait
+    if: needs.wait.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Say hi
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ok=false; auth_error=false
+          for attempt in 1 2 3; do
+            if timeout $PING_TIMEOUT_SECONDS claude -p "hi" --model haiku --output-format stream-json --verbose > out.jsonl 2> err.txt \
+               && jq -se 'map(select(.type == "result")) | .[0].is_error == false' out.jsonl > /dev/null; then
+              ok=true; break
+            fi
+            # Only look at error text: the rest of out.jsonl is full of IDs and
+            # numbers that can contain "401" by chance.
+            errors=$(cat err.txt; jq -r 'select(.type == "result" or .error != null)
+                                         | [.error, .result, .errors] | map(select(. != null) | tostring) | .[]' out.jsonl 2>/dev/null || true)
+            if grep -qiE '\b401\b|oauth|unauthori|authenticat|expired|invalid.*(token|key)' <<< "$errors"; then
+              auth_error=true; break
+            fi
+            echo "::warning::Ping attempt $attempt failed: $(tail -c 300 <<< "$errors")"
+            [ $attempt -lt 3 ] && sleep 60
+          done
+
+          now=$(date +%s)
+          if $ok; then
+            echo "Pinged at $(date -u -d @$now '+%T') UTC."
+            reset=$(jq -r 'select(.type == "rate_limit_event") | .rate_limit_info
+                           | .unifiedWindows.five_hour.resetsAt
+                             // (if .rateLimitType == "five_hour" then .resetsAt else empty end)' out.jsonl | head -1)
+            if [ -n "$reset" ] && [ "$reset" -gt "$now" ]; then
+              next=$(( reset + BUFFER_SECONDS )); why="window reset $(date -u -d @$reset '+%H:%M') UTC"
+            else
+              next=$(( now + FALLBACK_SECONDS )); why="no reset time reported, using 5h05m"
+            fi
+          elif $auth_error; then
+            echo "::error title=Claude token rejected::Run 'claude setup-token' in a terminal, then 'gh secret set CLAUDE_CODE_OAUTH_TOKEN' with the new token."
+            next=$(( now + AUTH_RETRY_SECONDS )); why="token rejected, retrying later"
+          else
+            echo "::error title=Ping failed::All 3 attempts failed; retrying in $(( RETRY_SECONDS / 60 )) min."
+            next=$(( now + RETRY_SECONDS )); why="ping failed, retrying soon"
+          fi
+
+          echo "$next" > next_run.txt
+          echo "Next ping: $(date -u -d @$next '+%F %T') UTC ($why)"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898333+github-actions[bot]@users.noreply.github.com"
+          git add next_run.txt
+          if ! git diff --cached --quiet; then
+            git commit -m "next ping: $(date -u -d @$next '+%Y-%m-%d %H:%M UTC') ($why)"
+            git push || { git pull --rebase && git push; }
+          fi
+
+          # Start the next waiter (it replaces any older one).
+          gh workflow run warmup.yml --ref main -f force=false -f chain=true
+          echo "Started the next waiter."
+
+          $ok
